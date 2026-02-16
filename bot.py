@@ -1,6 +1,6 @@
 """
 ربات تلگرام ارسال خودکار تبلیغات
-نسخه نهایی با دیتابیس قدرتمند
+نسخه نهایی با دیتابیس قدرتمند و بدون خطا
 طراحی شده برای دیپلوی روی Render.com
 """
 
@@ -10,6 +10,7 @@ import logging
 import sqlite3
 import time
 import threading
+import json
 from datetime import datetime
 from functools import wraps
 from contextlib import contextmanager
@@ -57,21 +58,38 @@ db_lock = threading.RLock()  # قفل بازگشتی برای امنیت بیش�
 def get_db():
     """مدیریت اتصال به دیتابیس با قفل"""
     with db_lock:
-        conn = sqlite3.connect(DATABASE, timeout=30)
-        conn.row_factory = sqlite3.Row
+        conn = None
         try:
+            conn = sqlite3.connect(DATABASE, timeout=30)
+            conn.row_factory = sqlite3.Row
             yield conn
             conn.commit()
         except Exception as e:
-            conn.rollback()
+            if conn:
+                conn.rollback()
             logger.error(f"❌ خطای دیتابیس: {e}")
             raise
         finally:
-            conn.close()
+            if conn:
+                conn.close()
 
-def init_database():
-    """ایجاد و مقداردهی اولیه دیتابیس"""
+def reset_database():
+    """حذف و ایجاد مجدد دیتابیس با ساختار صحیح"""
     try:
+        # حذف فایل دیتابیس قدیمی اگر خراب باشد
+        if os.path.exists(DATABASE):
+            try:
+                # تست اینکه فایل دیتابیس سالم است
+                with sqlite3.connect(DATABASE) as test_conn:
+                    test_conn.execute("SELECT 1")
+                logger.info("✅ دیتابیس موجود سالم است")
+                return False  # دیتابیس سالم است، نیازی به ریست نیست
+            except sqlite3.DatabaseError:
+                logger.warning("⚠️ دیتابیس خراب است، در حال حذف...")
+                os.remove(DATABASE)
+                logger.info("✅ فایل دیتابیس خراب حذف شد")
+        
+        # ایجاد دیتابیس جدید
         with get_db() as conn:
             cursor = conn.cursor()
             
@@ -123,7 +141,7 @@ def init_database():
                 )
             ''')
             
-            # درج تنظیمات پیش‌فرض
+            # اضافه کردن تنظیمات پیش‌فرض
             cursor.execute('SELECT COUNT(*) as count FROM settings')
             if cursor.fetchone()['count'] == 0:
                 cursor.execute('''
@@ -132,11 +150,12 @@ def init_database():
                 ''')
                 logger.info("✅ تنظیمات پیش‌فرض اضافه شد")
             
-            logger.info("✅ دیتابیس با موفقیت راه‌اندازی شد")
+            logger.info("✅ دیتابیس جدید با موفقیت ساخته شد")
+            return True
             
     except Exception as e:
-        logger.error(f"❌ خطای بحرانی در راه‌اندازی دیتابیس: {e}")
-        raise
+        logger.error(f"❌ خطا در ریست دیتابیس: {e}")
+        return False
 
 # ==================== توابع دیتابیس ====================
 def add_group_to_db(chat_id, username, title):
@@ -152,6 +171,7 @@ def add_group_to_db(chat_id, username, title):
             return True
     except Exception as e:
         logger.error(f"❌ خطا در ذخیره گروه: {e}")
+        log_error_to_db("add_group_error", str(e), str(chat_id))
         return False
 
 def get_all_groups_from_db():
@@ -171,7 +191,8 @@ def get_group_count():
         with get_db() as conn:
             cursor = conn.cursor()
             cursor.execute('SELECT COUNT(*) as count FROM groups WHERE is_active = 1')
-            return cursor.fetchone()['count']
+            result = cursor.fetchone()
+            return result['count'] if result else 0
     except Exception as e:
         logger.error(f"❌ خطا در دریافت تعداد گروه‌ها: {e}")
         return 0
@@ -204,6 +225,7 @@ def save_ad_to_db(message_type, content=None, file_id=None):
             return True
     except Exception as e:
         logger.error(f"❌ خطا در ذخیره تبلیغ: {e}")
+        log_error_to_db("ad_save_error", str(e))
         return False
 
 def get_active_ad_from_db():
@@ -327,16 +349,30 @@ def get_main_keyboard():
 
 # ==================== مدیریت وضعیت کاربران ====================
 user_states = {}
+user_data = {}
 
 def set_user_state(user_id, state, data=None):
-    user_states[user_id] = {'state': state, 'data': data or {}}
+    """تنظیم وضعیت کاربر"""
+    user_states[user_id] = state
+    if data:
+        user_data[user_id] = data
+    else:
+        user_data[user_id] = {}
 
 def get_user_state(user_id):
-    return user_states.get(user_id, {'state': None, 'data': {}})
+    """دریافت وضعیت کاربر"""
+    return user_states.get(user_id)
+
+def get_user_data(user_id):
+    """دریافت داده‌های کاربر"""
+    return user_data.get(user_id, {})
 
 def clear_user_state(user_id):
+    """پاک کردن وضعیت کاربر"""
     if user_id in user_states:
         del user_states[user_id]
+    if user_id in user_data:
+        del user_data[user_id]
 
 # ==================== هندلرهای ربات ====================
 @bot.message_handler(commands=['start'])
@@ -374,7 +410,7 @@ def add_advertisement(message):
         reply_markup=keyboard
     )
 
-@bot.message_handler(func=lambda m: get_user_state(m.from_user.id)['state'] == 'waiting_ad_type')
+@bot.message_handler(func=lambda m: get_user_state(m.from_user.id) == 'waiting_ad_type')
 @admin_only
 def process_ad_type(message):
     """پردازش نوع تبلیغ"""
@@ -406,12 +442,12 @@ def process_ad_type(message):
         bot.send_message(message.chat.id, f"📎 لطفاً {message.text} مورد نظر را ارسال کنید:")
 
 @bot.message_handler(content_types=['text', 'photo', 'video', 'document'], 
-                    func=lambda m: get_user_state(m.from_user.id)['state'] == 'waiting_ad_content')
+                    func=lambda m: get_user_state(m.from_user.id) == 'waiting_ad_content')
 @admin_only
 def process_ad_content(message):
     """پردازش محتوای تبلیغ"""
-    user_data = get_user_state(message.from_user.id)['data']
-    ad_type = user_data.get('type')
+    user_info = get_user_data(message.from_user.id)
+    ad_type = user_info.get('type')
     
     try:
         success = False
@@ -462,46 +498,52 @@ def add_group_start(message):
         "⚠️ نکته: ربات باید در گروه ادمین باشد."
     )
 
-@bot.message_handler(func=lambda m: get_user_state(m.from_user.id)['state'] == 'waiting_group_username')
+@bot.message_handler(func=lambda m: get_user_state(m.from_user.id) == 'waiting_group_username')
 @admin_only
 def process_group_username(message):
     """پردازش یوزرنیم گروه"""
     username = message.text.strip()
     
-    # دریافت اطلاعات گروه
-    chat_id, title = get_chat_id_from_username(username)
-    
-    if not chat_id:
-        bot.reply_to(
-            message, 
-            "❌ گروه مورد نظر یافت نشد.\n"
-            "مطمئن شوید:\n"
-            "1. یوزرنیم صحیح است\n"
-            "2. ربات در گروه عضو است"
-        )
-        return
-    
-    # بررسی ادمین بودن ربات
-    if not check_bot_admin(chat_id):
-        bot.reply_to(
-            message,
-            f"❌ ربات در گروه {title} ادمین نیست!\n"
-            "لطفاً ابتدا ربات را به عنوان ادمین به گروه اضافه کنید."
-        )
-        return
-    
-    # ذخیره در دیتابیس
-    if add_group_to_db(chat_id, username, title):
-        bot.reply_to(
-            message,
-            f"✅ گروه با موفقیت اضافه شد!\n\n"
-            f"📌 نام: {title}\n"
-            f"🆔 آیدی: {chat_id}\n"
-            f"🔗 یوزرنیم: {username}"
-        )
-        clear_user_state(message.from_user.id)
-    else:
-        bot.reply_to(message, "❌ خطا در ذخیره گروه. لطفاً دوباره تلاش کنید.")
+    try:
+        # دریافت اطلاعات گروه
+        chat_id, title = get_chat_id_from_username(username)
+        
+        if not chat_id:
+            bot.reply_to(
+                message, 
+                "❌ گروه مورد نظر یافت نشد.\n"
+                "مطمئن شوید:\n"
+                "1. یوزرنیم صحیح است\n"
+                "2. ربات در گروه عضو است"
+            )
+            return
+        
+        # بررسی ادمین بودن ربات
+        if not check_bot_admin(chat_id):
+            bot.reply_to(
+                message,
+                f"❌ ربات در گروه {title} ادمین نیست!\n"
+                "لطفاً ابتدا ربات را به عنوان ادمین به گروه اضافه کنید."
+            )
+            return
+        
+        # ذخیره در دیتابیس
+        if add_group_to_db(chat_id, username, title):
+            bot.reply_to(
+                message,
+                f"✅ گروه با موفقیت اضافه شد!\n\n"
+                f"📌 نام: {title}\n"
+                f"🆔 آیدی: {chat_id}\n"
+                f"🔗 یوزرنیم: {username}"
+            )
+            clear_user_state(message.from_user.id)
+        else:
+            bot.reply_to(message, "❌ خطا در ذخیره گروه. لطفاً دوباره تلاش کنید.")
+            
+    except Exception as e:
+        logger.error(f"❌ خطا در پردازش گروه: {e}")
+        log_error_to_db("add_group_error", str(e), username)
+        bot.reply_to(message, "❌ خطا در ارتباط با سرور. لطفاً دوباره تلاش کنید.")
 
 # ==================== لیست گروه‌ها ====================
 @bot.message_handler(func=lambda m: m.text == "📋 لیست گروه‌ها")
@@ -567,7 +609,7 @@ def schedule_settings(message):
     bot.send_message(message.chat.id, text, reply_markup=keyboard, parse_mode='Markdown')
     set_user_state(message.from_user.id, 'waiting_schedule_option')
 
-@bot.message_handler(func=lambda m: get_user_state(m.from_user.id)['state'] == 'waiting_schedule_option')
+@bot.message_handler(func=lambda m: get_user_state(m.from_user.id) == 'waiting_schedule_option')
 @admin_only
 def process_schedule_option(message):
     """پردازش گزینه تنظیمات"""
@@ -595,7 +637,7 @@ def process_schedule_option(message):
     else:
         bot.reply_to(message, "❌ گزینه نامعتبر است.")
 
-@bot.message_handler(func=lambda m: get_user_state(m.from_user.id)['state'] == 'waiting_interval')
+@bot.message_handler(func=lambda m: get_user_state(m.from_user.id) == 'waiting_interval')
 @admin_only
 def process_interval(message):
     """پردازش فاصله زمانی"""
@@ -615,7 +657,7 @@ def process_interval(message):
     except ValueError:
         bot.reply_to(message, "❌ لطفاً یک عدد صحیح وارد کنید.")
 
-@bot.message_handler(func=lambda m: get_user_state(m.from_user.id)['state'] == 'waiting_max_sends')
+@bot.message_handler(func=lambda m: get_user_state(m.from_user.id) == 'waiting_max_sends')
 @admin_only
 def process_max_sends(message):
     """پردازش تعداد ارسال"""
@@ -748,6 +790,63 @@ def back_to_main(message):
         reply_markup=get_main_keyboard()
     )
 
+# ==================== هندلر اضافه کردن گروه با کامند ====================
+@bot.message_handler(commands=['addgroup'])
+@admin_only
+def add_group_by_command(message):
+    """اضافه کردن گروه با دستور /addgroup آیدی_گروه یا یوزرنیم"""
+    try:
+        parts = message.text.split()
+        if len(parts) < 2:
+            bot.reply_to(message, "❌ فرمت صحیح: /addgroup @یوزرنیم یا /addgroup -100123456789")
+            return
+        
+        group_identifier = parts[1].strip()
+        
+        # تشخیص اینکه یوزرنیم است یا آیدی عددی
+        if group_identifier.startswith('@') or not group_identifier.replace('-', '').isdigit():
+            # یوزرنیم
+            chat_id, title = get_chat_id_from_username(group_identifier)
+        else:
+            # آیدی عددی
+            chat_id = int(group_identifier)
+            try:
+                chat = bot.get_chat(chat_id)
+                title = chat.title
+                group_identifier = f"@{chat.username}" if chat.username else str(chat_id)
+            except Exception as e:
+                bot.reply_to(message, f"❌ خطا در دریافت اطلاعات گروه: {e}")
+                return
+        
+        if not chat_id:
+            bot.reply_to(message, "❌ گروه مورد نظر یافت نشد.")
+            return
+        
+        # بررسی ادمین بودن ربات
+        if not check_bot_admin(chat_id):
+            bot.reply_to(
+                message,
+                f"❌ ربات در گروه {title} ادمین نیست!\n"
+                "لطفاً ابتدا ربات را ادمین کنید."
+            )
+            return
+        
+        # ذخیره در دیتابیس
+        if add_group_to_db(chat_id, group_identifier, title):
+            bot.reply_to(
+                message,
+                f"✅ گروه با موفقیت اضافه شد!\n\n"
+                f"📌 نام: {title}\n"
+                f"🆔 آیدی: {chat_id}\n"
+                f"🔗 شناسه: {group_identifier}"
+            )
+        else:
+            bot.reply_to(message, "❌ خطا در ذخیره گروه.")
+            
+    except Exception as e:
+        logger.error(f"❌ خطا در addgroup: {e}")
+        bot.reply_to(message, f"❌ خطا: {e}")
+
 # ==================== هندلر پیش‌فرض ====================
 @bot.message_handler(func=lambda m: True)
 def default_handler(message):
@@ -808,10 +907,9 @@ def auto_sender_worker():
                     increment_send_count_in_db()
                     
                     # بررسی محدودیت تعداد
-                    if settings['max_sends'] > 0:
-                        if settings['current_sends'] + 1 >= settings['max_sends']:
-                            update_settings_in_db(is_running=False)
-                            logger.info("⛔ محدودیت تعداد رسید، ارسال متوقف شد")
+                    if settings['max_sends'] > 0 and settings['current_sends'] + 1 >= settings['max_sends']:
+                        update_settings_in_db(is_running=False)
+                        logger.info("⛔ محدودیت تعداد رسید، ارسال متوقف شد")
             
             # خواب بر اساس تنظیمات
             sleep_time = (settings['interval_minutes'] * 60) if settings else 300
@@ -904,12 +1002,53 @@ def db_test():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+@app.route('/add_group_direct/<username>', methods=['GET'])
+def add_group_direct(username):
+    """اضافه کردن مستقیم گروه با یوزرنیم (برای تست)"""
+    try:
+        # دریافت chat_id
+        chat = bot.get_chat(f"@{username}")
+        chat_id = chat.id
+        title = chat.title
+        
+        # ذخیره در دیتابیس
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO groups (chat_id, username, title, is_active)
+                VALUES (?, ?, ?, 1)
+            ''', (str(chat_id), f"@{username}", title))
+            
+        return jsonify({
+            'success': True,
+            'chat_id': chat_id,
+            'title': title,
+            'message': f'✅ گروه {title} با موفقیت اضافه شد'
+        }), 200
+        
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 400
+
+@app.route('/reset_db', methods=['GET'])
+def reset_db_route():
+    """ریست کردن دیتابیس"""
+    try:
+        if reset_database():
+            return jsonify({'success': True, 'message': '✅ دیتابیس با موفقیت ریست شد'})
+        else:
+            return jsonify({'success': False, 'message': '❌ خطا در ریست دیتابیس'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 # ==================== اجرای اصلی ====================
 if __name__ == '__main__':
     try:
         # راه‌اندازی دیتابیس
         logger.info("🔄 راه‌اندازی دیتابیس...")
-        init_database()
+        reset_database()
         
         # تست دیتابیس
         test_groups = get_all_groups_from_db()
