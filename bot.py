@@ -1,557 +1,610 @@
 """
 ربات تلگرام ارسال خودکار تبلیغات
-قابل دیپلوی روی Render.com
-ساخته شده با Flask + Telebot + Webhook
+طراحی شده برای دیپلوی روی Render.com
+نسخه اصلاح شده برای رفع مشکل دیتابیس
 """
 
 import os
-import json
-import time
-import asyncio
+import sys
 import logging
 import sqlite3
-from datetime import datetime, timedelta
-from threading import Thread
+import json
+import asyncio
+import threading
+import time
+from datetime import datetime
 from functools import wraps
+from contextlib import contextmanager
 
 from flask import Flask, request, jsonify
 import telebot
-from telebot.types import ReplyKeyboardMarkup, KeyboardButton, Message
-from telebot.apihelper import ApiTelegramException
+from telebot.types import ReplyKeyboardMarkup, KeyboardButton
 
 # ==================== تنظیمات اولیه ====================
-# دریافت متغیرهای محیطی
-BOT_TOKEN = os.environ.get('BOT_TOKEN')
-WEBHOOK_URL = os.environ.get('WEBHOOK_URL')
-ADMIN_ID = int(os.environ.get('ADMIN_ID', 0))
-
-if not all([BOT_TOKEN, WEBHOOK_URL, ADMIN_ID]):
-    raise ValueError("لطفاً تمام متغیرهای محیطی را تنظیم کنید!")
-
-# تنظیم لاگینگ
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# ایجاد اپلیکیشن Flask و ربات
-app = Flask(__name__)
-bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
+# دریافت متغیرهای محیطی
+BOT_TOKEN = os.environ.get('BOT_TOKEN')
+if not BOT_TOKEN:
+    logger.error("BOT_TOKEN تنظیم نشده است!")
+    sys.exit(1)
 
-# ==================== دیتابیس ====================
+WEBHOOK_URL = os.environ.get('WEBHOOK_URL')
+if not WEBHOOK_URL:
+    logger.error("WEBHOOK_URL تنظیم نشده است!")
+    sys.exit(1)
+
+ADMIN_ID = os.environ.get('ADMIN_ID')
+if not ADMIN_ID:
+    logger.error("ADMIN_ID تنظیم نشده است!")
+    sys.exit(1)
+
+# تبدیل ADMIN_ID به عدد صحیح
+try:
+    ADMIN_ID = int(ADMIN_ID)
+except ValueError:
+    logger.error("ADMIN_ID باید یک عدد صحیح باشد!")
+    sys.exit(1)
+
+# ==================== راه‌اندازی ربات و Flask ====================
+bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
+app = Flask(__name__)
+
+# ==================== مدیریت دیتابیس ====================
+DATABASE = 'bot_data.db'
+
+# قفل برای دسترسی هم‌زمان به دیتابیس
+db_lock = threading.Lock()
+
+@contextmanager
 def get_db():
-    """ایجاد اتصال به دیتابیس SQLite"""
-    conn = sqlite3.connect('bot_data.db', check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+    """مدیریت context دیتابیس با قفل"""
+    with db_lock:
+        conn = sqlite3.connect(DATABASE, timeout=30, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            raise e
+        finally:
+            conn.close()
 
 def init_database():
     """ایجاد جداول دیتابیس"""
-    conn = get_db()
-    cursor = conn.cursor()
-    
-    # جدول گروه‌ها
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS groups (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id TEXT UNIQUE,
-            username TEXT,
-            title TEXT,
-            added_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            is_active BOOLEAN DEFAULT 1
-        )
-    ''')
-    
-    # جدول تبلیغات
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS ads (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            type TEXT,
-            content TEXT,
-            file_id TEXT,
-            created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    # جدول تنظیمات زمان‌بندی
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS schedule (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            interval_minutes INTEGER DEFAULT 5,
-            total_count INTEGER DEFAULT 0,
-            sent_count INTEGER DEFAULT 0,
-            is_active BOOLEAN DEFAULT 0,
-            last_sent TIMESTAMP,
-            updated_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    # درج تنظیمات پیش‌فرض
-    cursor.execute('SELECT COUNT(*) as count FROM schedule')
-    if cursor.fetchone()['count'] == 0:
-        cursor.execute('INSERT INTO schedule (interval_minutes, total_count) VALUES (5, 0)')
-    
-    conn.commit()
-    conn.close()
-    logger.info("دیتابیس راه‌اندازی شد")
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            
+            # جدول گروه‌ها
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS groups (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id TEXT UNIQUE NOT NULL,
+                    username TEXT,
+                    title TEXT,
+                    is_active INTEGER DEFAULT 1,
+                    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # جدول تبلیغات
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS advertisements (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    message_type TEXT NOT NULL,
+                    content TEXT,
+                    file_id TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    is_active INTEGER DEFAULT 1
+                )
+            ''')
+            
+            # جدول تنظیمات زمان‌بندی
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS schedule_settings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    interval_minutes INTEGER DEFAULT 5,
+                    max_sends INTEGER DEFAULT 0,
+                    current_sends INTEGER DEFAULT 0,
+                    is_running INTEGER DEFAULT 0,
+                    last_send_time TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # درج تنظیمات پیش‌فرض اگر وجود نداشته باشد
+            cursor.execute('SELECT COUNT(*) as count FROM schedule_settings')
+            if cursor.fetchone()['count'] == 0:
+                cursor.execute('''
+                    INSERT INTO schedule_settings (interval_minutes, max_sends, is_running)
+                    VALUES (5, 0, 0)
+                ''')
+            
+            logger.info("✅ دیتابیس با موفقیت راه‌اندازی شد")
+    except Exception as e:
+        logger.error(f"❌ خطا در راه‌اندازی دیتابیس: {e}")
 
-# ==================== تابع‌های کمکی ====================
+# ==================== توابع کمکی دیتابیس ====================
+def save_group(chat_id, username, title):
+    """ذخیره گروه در دیتابیس"""
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO groups (chat_id, username, title, is_active)
+                VALUES (?, ?, ?, 1)
+            ''', (str(chat_id), username, title))
+            return True
+    except Exception as e:
+        logger.error(f"خطا در ذخیره گروه: {e}")
+        return False
+
+def get_all_groups():
+    """دریافت لیست تمام گروه‌ها"""
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT * FROM groups WHERE is_active = 1 ORDER BY added_at DESC')
+            return cursor.fetchall()
+    except Exception as e:
+        logger.error(f"خطا در دریافت گروه‌ها: {e}")
+        return []
+
+def save_advertisement(message_type, content=None, file_id=None):
+    """ذخیره تبلیغ در دیتابیس"""
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO advertisements (message_type, content, file_id)
+                VALUES (?, ?, ?)
+            ''', (message_type, content, file_id))
+            return True
+    except Exception as e:
+        logger.error(f"خطا در ذخیره تبلیغ: {e}")
+        return False
+
+def get_active_advertisement():
+    """دریافت آخرین تبلیغ فعال"""
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT * FROM advertisements 
+                WHERE is_active = 1 
+                ORDER BY created_at DESC LIMIT 1
+            ''')
+            return cursor.fetchone()
+    except Exception as e:
+        logger.error(f"خطا در دریافت تبلیغ: {e}")
+        return None
+
+def remove_inactive_group(chat_id):
+    """غیرفعال کردن گروه"""
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute('UPDATE groups SET is_active = 0 WHERE chat_id = ?', (str(chat_id),))
+            return True
+    except Exception as e:
+        logger.error(f"خطا در غیرفعال کردن گروه: {e}")
+        return False
+
+def get_schedule_settings():
+    """دریافت تنظیمات زمان‌بندی"""
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT * FROM schedule_settings LIMIT 1')
+            return cursor.fetchone()
+    except Exception as e:
+        logger.error(f"خطا در دریافت تنظیمات: {e}")
+        return None
+
+def update_schedule_settings(interval=None, max_sends=None, is_running=None):
+    """به‌روزرسانی تنظیمات زمان‌بندی"""
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            if interval is not None:
+                cursor.execute('UPDATE schedule_settings SET interval_minutes = ?', (interval,))
+            if max_sends is not None:
+                cursor.execute('UPDATE schedule_settings SET max_sends = ?, current_sends = 0', (max_sends,))
+            if is_running is not None:
+                cursor.execute('UPDATE schedule_settings SET is_running = ?', (1 if is_running else 0,))
+            cursor.execute('UPDATE schedule_settings SET updated_at = CURRENT_TIMESTAMP')
+            return True
+    except Exception as e:
+        logger.error(f"خطا در به‌روزرسانی تنظیمات: {e}")
+        return False
+
+def increment_send_count():
+    """افزایش تعداد ارسال‌ها"""
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE schedule_settings 
+                SET current_sends = current_sends + 1,
+                    last_send_time = CURRENT_TIMESTAMP
+            ''')
+            return True
+    except Exception as e:
+        logger.error(f"خطا در افزایش تعداد ارسال: {e}")
+        return False
+
+# ==================== توابع کمکی ====================
 def admin_only(func):
-    """دکوراتور برای محدود کردن دسترسی به ادمین"""
+    """دکوریتور برای محدود کردن دسترسی به ادمین"""
     @wraps(func)
     def wrapper(message):
         if message.from_user.id != ADMIN_ID:
-            bot.reply_to(message, "⛔ شما اجازه استفاده از این دستور را ندارید!")
+            bot.reply_to(message, "⛔ شما اجازه استفاده از این دستور را ندارید.")
             return
         return func(message)
     return wrapper
 
-def get_main_keyboard():
-    """ایجاد کیبورد اصلی"""
-    keyboard = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    buttons = [
-        KeyboardButton("📤 ثبت تبلیغ"),
-        KeyboardButton("👥 افزودن گروه"),
-        KeyboardButton("📋 لیست گروه‌ها"),
-        KeyboardButton("⏱ تنظیم زمان ارسال"),
-        KeyboardButton("▶️ شروع ارسال"),
-        KeyboardButton("⛔ توقف ارسال"),
-        KeyboardButton("📊 وضعیت")
-    ]
-    keyboard.add(*buttons)
-    return keyboard
-
 def get_chat_id_from_username(username):
-    """دریافت chat_id از روی یوزرنیم گروه"""
+    """دریافت chat_id از یوزرنیم گروه"""
     try:
-        chat = bot.get_chat(username)
-        return str(chat.id), chat.title
+        username = username.strip().lstrip('@')
+        chat = bot.get_chat(f"@{username}")
+        return chat.id, chat.title
     except Exception as e:
         logger.error(f"خطا در دریافت chat_id برای {username}: {e}")
         return None, None
 
+def check_bot_admin(chat_id):
+    """بررسی اینکه ربات در گروه ادمین است"""
+    try:
+        bot_member = bot.get_chat_member(chat_id, bot.get_me().id)
+        return bot_member.status in ['administrator', 'creator']
+    except Exception as e:
+        logger.error(f"خطا در بررسی وضعیت ادمین: {e}")
+        return False
+
+def get_main_keyboard():
+    """ایجاد کیبورد اصلی"""
+    keyboard = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    keyboard.add(
+        KeyboardButton("📤 ثبت تبلیغ"),
+        KeyboardButton("👥 افزودن گروه")
+    )
+    keyboard.add(
+        KeyboardButton("📋 لیست گروه‌ها"),
+        KeyboardButton("⏱ تنظیم زمان ارسال")
+    )
+    keyboard.add(
+        KeyboardButton("▶️ شروع ارسال"),
+        KeyboardButton("⛔ توقف ارسال")
+    )
+    keyboard.add(KeyboardButton("📊 وضعیت"))
+    return keyboard
+
 # ==================== مدیریت وضعیت کاربران ====================
 user_states = {}
-user_data = {}
 
 def set_user_state(user_id, state, data=None):
     """تنظیم وضعیت کاربر"""
-    user_states[user_id] = state
-    if data:
-        if user_id not in user_data:
-            user_data[user_id] = {}
-        user_data[user_id].update(data)
+    user_states[user_id] = {'state': state, 'data': data or {}}
 
 def get_user_state(user_id):
     """دریافت وضعیت کاربر"""
-    return user_states.get(user_id)
+    return user_states.get(user_id, {'state': None, 'data': {}})
 
 def clear_user_state(user_id):
     """پاک کردن وضعیت کاربر"""
     if user_id in user_states:
         del user_states[user_id]
-    if user_id in user_data:
-        del user_data[user_id]
 
 # ==================== هندلرهای ربات ====================
 @bot.message_handler(commands=['start'])
 def start_command(message):
-    """هندلر دستور start"""
-    if message.from_user.id == ADMIN_ID:
-        bot.reply_to(
-            message,
-            "✨ به ربات مدیریت تبلیغات خوش آمدید!\n\n"
-            "از منوی زیر برای مدیریت ربات استفاده کنید:",
-            reply_markup=get_main_keyboard()
-        )
-    else:
-        bot.reply_to(message, "🤖 این ربات برای مدیریت تبلیغات خودکار طراحی شده است.")
+    """دستور شروع"""
+    if message.from_user.id != ADMIN_ID:
+        bot.reply_to(message, "⛔ شما اجازه استفاده از این ربات را ندارید.")
+        return
+    
+    bot.send_message(
+        message.chat.id,
+        "🤖 به ربات ارسال خودکار تبلیغات خوش آمدید!\n\nاز منوی زیر استفاده کنید:",
+        reply_markup=get_main_keyboard()
+    )
 
-@bot.message_handler(func=lambda msg: msg.text == "📤 ثبت تبلیغ")
+@bot.message_handler(func=lambda message: message.text == "📤 ثبت تبلیغ")
 @admin_only
-def register_ad(message):
+def add_advertisement(message):
     """شروع فرآیند ثبت تبلیغ"""
-    set_user_state(message.from_user.id, "waiting_for_ad_type")
-    keyboard = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
-    keyboard.add("متن", "عکس", "ویدیو", "فایل", "لغو")
-    bot.reply_to(
-        message,
+    set_user_state(message.from_user.id, 'waiting_ad_type')
+    
+    keyboard = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    keyboard.add("متن", "عکس")
+    keyboard.add("ویدیو", "فایل")
+    keyboard.add("🔙 بازگشت")
+    
+    bot.send_message(
+        message.chat.id,
         "📝 نوع تبلیغ را انتخاب کنید:",
         reply_markup=keyboard
     )
 
-@bot.message_handler(func=lambda msg: msg.text == "👥 افزودن گروه")
+@bot.message_handler(func=lambda message: get_user_state(message.from_user.id)['state'] == 'waiting_ad_type')
 @admin_only
-def add_group(message):
-    """شروع فرآیند افزودن گروه"""
-    set_user_state(message.from_user.id, "waiting_for_group_username")
-    bot.reply_to(
-        message,
-        "🔗 لطفاً یوزرنیم گروه را با @ وارد کنید:\n"
-        "مثال: @mygroup\n\n"
-        "توجه: ربات باید در گروه ادمین باشد!"
-    )
-
-@bot.message_handler(func=lambda msg: msg.text == "📋 لیست گروه‌ها")
-@admin_only
-def list_groups(message):
-    """نمایش لیست گروه‌ها"""
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute('SELECT * FROM groups WHERE is_active = 1 ORDER BY added_date DESC')
-    groups = cursor.fetchall()
-    conn.close()
-    
-    if not groups:
-        bot.reply_to(message, "📭 هیچ گروهی ثبت نشده است!")
-        return
-    
-    text = "📋 لیست گروه‌های فعال:\n\n"
-    for group in groups:
-        text += f"🔹 {group['title']}\n"
-        text += f"   آیدی: {group['chat_id']}\n"
-        text += f"   یوزرنیم: {group['username']}\n"
-        text += "-" * 20 + "\n"
-    
-    bot.reply_to(message, text)
-
-@bot.message_handler(func=lambda msg: msg.text == "⏱ تنظیم زمان ارسال")
-@admin_only
-def set_schedule(message):
-    """تنظیم زمان‌بندی ارسال"""
-    set_user_state(message.from_user.id, "waiting_for_interval")
-    bot.reply_to(
-        message,
-        "⏱ لطفاً فاصله زمانی ارسال را به دقیقه وارد کنید:\n"
-        "(مثال: 5 برای ارسال هر 5 دقیقه)"
-    )
-
-@bot.message_handler(func=lambda msg: msg.text == "▶️ شروع ارسال")
-@admin_only
-def start_sending(message):
-    """شروع ارسال خودکار"""
-    conn = get_db()
-    cursor = conn.cursor()
-    
-    # بررسی وجود تبلیغ
-    cursor.execute('SELECT COUNT(*) as count FROM ads')
-    if cursor.fetchone()['count'] == 0:
-        bot.reply_to(message, "❌ ابتدا یک تبلیغ ثبت کنید!")
-        conn.close()
-        return
-    
-    # بررسی وجود گروه
-    cursor.execute('SELECT COUNT(*) as count FROM groups WHERE is_active = 1')
-    if cursor.fetchone()['count'] == 0:
-        bot.reply_to(message, "❌ حداقل یک گروه فعال ثبت کنید!")
-        conn.close()
-        return
-    
-    cursor.execute('UPDATE schedule SET is_active = 1, updated_date = CURRENT_TIMESTAMP')
-    conn.commit()
-    conn.close()
-    
-    bot.reply_to(message, "✅ ارسال خودکار شروع شد!")
-
-@bot.message_handler(func=lambda msg: msg.text == "⛔ توقف ارسال")
-@admin_only
-def stop_sending(message):
-    """توقف ارسال خودکار"""
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute('UPDATE schedule SET is_active = 0, updated_date = CURRENT_TIMESTAMP')
-    conn.commit()
-    conn.close()
-    
-    bot.reply_to(message, "⏸ ارسال خودکار متوقف شد!")
-
-@bot.message_handler(func=lambda msg: msg.text == "📊 وضعیت")
-@admin_only
-def show_status(message):
-    """نمایش وضعیت ربات"""
-    conn = get_db()
-    cursor = conn.cursor()
-    
-    cursor.execute('SELECT COUNT(*) as count FROM groups WHERE is_active = 1')
-    groups_count = cursor.fetchone()['count']
-    
-    cursor.execute('SELECT COUNT(*) as count FROM ads')
-    ads_count = cursor.fetchone()['count']
-    
-    cursor.execute('SELECT * FROM schedule WHERE id = 1')
-    schedule = cursor.fetchone()
-    
-    conn.close()
-    
-    status_text = f"📊 وضعیت ربات:\n\n"
-    status_text += f"👥 گروه‌های فعال: {groups_count}\n"
-    status_text += f"📝 تبلیغات: {ads_count}\n"
-    status_text += f"⏱ فاصله ارسال: {schedule['interval_minutes']} دقیقه\n"
-    status_text += f"📨 ارسال شده: {schedule['sent_count']}\n"
-    status_text += f"⚡ وضعیت: {'✅ فعال' if schedule['is_active'] else '⏸ غیرفعال'}\n"
-    
-    if schedule['total_count'] > 0:
-        status_text += f"🎯 هدف: {schedule['sent_count']}/{schedule['total_count']}\n"
-    
-    bot.reply_to(message, status_text)
-
-# ==================== هندلرهای مراحل ====================
-@bot.message_handler(func=lambda msg: get_user_state(msg.from_user.id) == "waiting_for_ad_type")
-@admin_only
-def handle_ad_type(message):
-    """دریافت نوع تبلیغ"""
-    if message.text == "لغو":
+def process_ad_type(message):
+    """پردازش نوع تبلیغ"""
+    if message.text == "🔙 بازگشت":
         clear_user_state(message.from_user.id)
-        bot.reply_to(message, "❌ عملیات لغو شد.", reply_markup=get_main_keyboard())
+        bot.send_message(message.chat.id, "🔙 بازگشت به منوی اصلی", reply_markup=get_main_keyboard())
         return
     
-    ad_type_map = {
+    type_map = {
         "متن": "text",
         "عکس": "photo",
         "ویدیو": "video",
         "فایل": "document"
     }
     
-    if message.text not in ad_type_map:
-        bot.reply_to(message, "❌ لطفاً یک گزینه معتبر انتخاب کنید!")
+    if message.text not in type_map:
+        bot.reply_to(message, "❌ لطفاً یک گزینه معتبر انتخاب کنید.")
         return
     
     set_user_state(
         message.from_user.id,
-        "waiting_for_ad_content",
-        {"ad_type": ad_type_map[message.text]}
+        'waiting_ad_content',
+        {'type': type_map[message.text]}
     )
     
     if message.text == "متن":
-        bot.reply_to(message, "📝 لطفاً متن تبلیغ را ارسال کنید:")
+        bot.send_message(message.chat.id, "📝 لطفاً متن تبلیغ را ارسال کنید:")
     else:
-        bot.reply_to(message, f"📎 لطفاً {message.text} تبلیغ را ارسال کنید:")
+        bot.send_message(message.chat.id, f"📎 لطفاً {message.text} مورد نظر را ارسال کنید:")
 
-@bot.message_handler(
-    content_types=['text', 'photo', 'video', 'document'],
-    func=lambda msg: get_user_state(msg.from_user.id) == "waiting_for_ad_content"
-)
+@bot.message_handler(content_types=['text', 'photo', 'video', 'document'], 
+                    func=lambda message: get_user_state(message.from_user.id)['state'] == 'waiting_ad_content')
 @admin_only
-def handle_ad_content(message):
-    """دریافت محتوای تبلیغ"""
-    user_id = message.from_user.id
-    user_info = user_data.get(user_id, {})
-    ad_type = user_info.get('ad_type')
+def process_ad_content(message):
+    """پردازش محتوای تبلیغ"""
+    user_data = get_user_state(message.from_user.id)['data']
+    ad_type = user_data.get('type')
     
-    # بررسی تطابق نوع ارسالی با نوع درخواستی
-    content_type = None
-    content = None
-    file_id = None
-    
-    if message.content_type == 'text' and ad_type == 'text':
-        content_type = 'text'
-        content = message.text
-    elif message.content_type == 'photo' and ad_type == 'photo':
-        content_type = 'photo'
-        file_id = message.photo[-1].file_id
-    elif message.content_type == 'video' and ad_type == 'video':
-        content_type = 'video'
-        file_id = message.video.file_id
-    elif message.content_type == 'document' and ad_type == 'document':
-        content_type = 'document'
-        file_id = message.document.file_id
-    
-    if not content_type:
-        bot.reply_to(message, "❌ نوع فایل ارسالی با نوع درخواستی مطابقت ندارد!")
-        return
-    
-    # ذخیره در دیتابیس
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute(
-        'INSERT INTO ads (type, content, file_id) VALUES (?, ?, ?)',
-        (content_type, content, file_id)
-    )
-    conn.commit()
-    conn.close()
-    
-    clear_user_state(user_id)
-    bot.reply_to(
-        message,
-        "✅ تبلیغ با موفقیت ثبت شد!",
-        reply_markup=get_main_keyboard()
+    try:
+        success = False
+        
+        if ad_type == 'text' and message.text:
+            success = save_advertisement('text', content=message.text)
+            reply_text = "✅ متن تبلیغ با موفقیت ثبت شد!"
+            
+        elif ad_type == 'photo' and message.photo:
+            file_id = message.photo[-1].file_id
+            caption = message.caption or ""
+            success = save_advertisement('photo', content=caption, file_id=file_id)
+            reply_text = "✅ عکس با موفقیت ثبت شد!"
+            
+        elif ad_type == 'video' and message.video:
+            file_id = message.video.file_id
+            caption = message.caption or ""
+            success = save_advertisement('video', content=caption, file_id=file_id)
+            reply_text = "✅ ویدیو با موفقیت ثبت شد!"
+            
+        elif ad_type == 'document' and message.document:
+            file_id = message.document.file_id
+            caption = message.caption or ""
+            success = save_advertisement('document', content=caption, file_id=file_id)
+            reply_text = "✅ فایل با موفقیت ثبت شد!"
+        
+        if success:
+            bot.send_message(message.chat.id, reply_text, reply_markup=get_main_keyboard())
+            clear_user_state(message.from_user.id)
+        else:
+            bot.reply_to(message, "❌ خطا در ثبت تبلیغ. لطفاً دوباره تلاش کنید.")
+            
+    except Exception as e:
+        logger.error(f"خطا در پردازش محتوای تبلیغ: {e}")
+        bot.reply_to(message, "❌ خطایی رخ داد. لطفاً دوباره تلاش کنید.")
+
+@bot.message_handler(func=lambda message: message.text == "👥 افزودن گروه")
+@admin_only
+def add_group(message):
+    """شروع فرآیند افزودن گروه"""
+    set_user_state(message.from_user.id, 'waiting_group_username')
+    bot.send_message(
+        message.chat.id,
+        "🔗 لطفاً یوزرنیم گروه را با @ وارد کنید:\nمثال: @mygroup"
     )
 
-@bot.message_handler(func=lambda msg: get_user_state(msg.from_user.id) == "waiting_for_group_username")
+@bot.message_handler(func=lambda message: get_user_state(message.from_user.id)['state'] == 'waiting_group_username')
 @admin_only
-def handle_group_username(message):
-    """دریافت یوزرنیم گروه و ثبت آن"""
+def process_group_username(message):
+    """پردازش یوزرنیم گروه"""
     username = message.text.strip()
-    if not username.startswith('@'):
-        bot.reply_to(message, "❌ لطفاً یوزرنیم را با @ وارد کنید!")
-        return
     
-    # دریافت chat_id و عنوان گروه
     chat_id, title = get_chat_id_from_username(username)
     
     if not chat_id:
-        bot.reply_to(
-            message,
-            "❌ خطا در دریافت اطلاعات گروه!\n"
-            "مطمئن شوید:\n"
-            "1. یوزرنیم صحیح است\n"
-            "2. ربات در گروه عضو است\n"
-            "3. ربات در گروه ادمین است"
-        )
+        bot.reply_to(message, "❌ گروه مورد نظر یافت نشد.")
         return
     
-    # بررسی ادمین بودن ربات
-    try:
-        bot.get_chat_administrators(chat_id)
-    except Exception as e:
-        bot.reply_to(
-            message,
-            f"❌ ربات در گروه {username} ادمین نیست!\n"
-            "لطفاً ابتدا ربات را ادمین کنید."
-        )
+    if not check_bot_admin(chat_id):
+        bot.reply_to(message, "❌ ربات در این گروه ادمین نیست.")
         return
     
-    # ذخیره در دیتابیس
-    conn = get_db()
-    cursor = conn.cursor()
-    try:
-        cursor.execute(
-            'INSERT INTO groups (chat_id, username, title) VALUES (?, ?, ?)',
-            (chat_id, username, title)
-        )
-        conn.commit()
-        bot.reply_to(
-            message,
-            f"✅ گروه {title} با موفقیت ثبت شد!\n"
-            f"آیدی گروه: {chat_id}",
-            reply_markup=get_main_keyboard()
-        )
-    except sqlite3.IntegrityError:
-        bot.reply_to(message, "❌ این گروه قبلاً ثبت شده است!")
-    finally:
-        conn.close()
+    if save_group(chat_id, username, title):
+        bot.reply_to(message, f"✅ گروه {title} با موفقیت اضافه شد!")
         clear_user_state(message.from_user.id)
+    else:
+        bot.reply_to(message, "❌ خطا در ذخیره گروه.")
 
-@bot.message_handler(func=lambda msg: get_user_state(msg.from_user.id) == "waiting_for_interval")
+@bot.message_handler(func=lambda message: message.text == "📋 لیست گروه‌ها")
 @admin_only
-def handle_interval(message):
-    """دریافت فاصله زمانی"""
+def list_groups(message):
+    """نمایش لیست گروه‌ها"""
+    groups = get_all_groups()
+    
+    if not groups:
+        bot.send_message(message.chat.id, "📭 هیچ گروه فعالی وجود ندارد.")
+        return
+    
+    text = "📋 لیست گروه‌های فعال:\n\n"
+    for i, group in enumerate(groups, 1):
+        text += f"{i}. {group['title']}\n"
+        text += f"   یوزرنیم: {group['username']}\n"
+        text += f"   آیدی: {group['chat_id']}\n\n"
+    
+    # ارسال در چند بخش اگر طولانی شد
+    if len(text) > 4000:
+        for i in range(0, len(text), 4000):
+            bot.send_message(message.chat.id, text[i:i+4000])
+    else:
+        bot.send_message(message.chat.id, text)
+
+@bot.message_handler(func=lambda message: message.text == "⏱ تنظیم زمان ارسال")
+@admin_only
+def schedule_settings(message):
+    """تنظیمات زمان‌بندی"""
+    settings = get_schedule_settings()
+    
+    if not settings:
+        bot.reply_to(message, "❌ خطا در دریافت تنظیمات.")
+        return
+    
+    text = "⚙️ تنظیمات فعلی:\n\n"
+    text += f"⏱ فاصله ارسال: {settings['interval_minutes']} دقیقه\n"
+    text += f"📊 تعداد ارسال: "
+    text += "نامحدود" if settings['max_sends'] == 0 else f"{settings['current_sends']}/{settings['max_sends']}\n"
+    text += f"▶️ وضعیت: {'فعال' if settings['is_running'] else 'غیرفعال'}\n\n"
+    
+    keyboard = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    keyboard.add("⏱ تنظیم فاصله", "📊 تنظیم تعداد")
+    keyboard.add("🔙 بازگشت")
+    
+    bot.send_message(message.chat.id, text, reply_markup=keyboard)
+    set_user_state(message.from_user.id, 'waiting_schedule_option')
+
+@bot.message_handler(func=lambda message: get_user_state(message.from_user.id)['state'] == 'waiting_schedule_option')
+@admin_only
+def process_schedule_option(message):
+    """پردازش گزینه تنظیم زمان"""
+    if message.text == "🔙 بازگشت":
+        clear_user_state(message.from_user.id)
+        bot.send_message(message.chat.id, "🔙 بازگشت به منوی اصلی", reply_markup=get_main_keyboard())
+        return
+    
+    if message.text == "⏱ تنظیم فاصله":
+        set_user_state(message.from_user.id, 'waiting_interval')
+        bot.send_message(message.chat.id, "⏱ لطفاً فاصله ارسال را به دقیقه وارد کنید:")
+    
+    elif message.text == "📊 تنظیم تعداد":
+        set_user_state(message.from_user.id, 'waiting_max_sends')
+        bot.send_message(message.chat.id, "📊 لطفاً تعداد دفعات ارسال را وارد کنید (0 برای نامحدود):")
+    
+    else:
+        bot.reply_to(message, "❌ گزینه نامعتبر.")
+
+@bot.message_handler(func=lambda message: get_user_state(message.from_user.id)['state'] == 'waiting_interval')
+@admin_only
+def process_interval(message):
+    """پردازش فاصله ارسال"""
     try:
         interval = int(message.text)
         if interval < 1:
-            raise ValueError()
+            bot.reply_to(message, "❌ فاصله باید حداقل 1 دقیقه باشد.")
+            return
         
-        conn = get_db()
-        cursor = conn.cursor()
-        cursor.execute(
-            'UPDATE schedule SET interval_minutes = ?, updated_date = CURRENT_TIMESTAMP WHERE id = 1',
-            (interval,)
-        )
-        conn.commit()
-        conn.close()
-        
-        bot.reply_to(
-            message,
-            f"✅ فاصله زمانی با موفقیت به {interval} دقیقه تنظیم شد!",
-            reply_markup=get_main_keyboard()
-        )
-        clear_user_state(message.from_user.id)
-        
-    except ValueError:
-        bot.reply_to(message, "❌ لطفاً یک عدد معتبر وارد کنید!")
-
-# ==================== سیستم ارسال خودکار ====================
-async def send_ad_to_group(chat_id, ad):
-    """ارسال تبلیغ به یک گروه خاص"""
-    try:
-        if ad['type'] == 'text':
-            bot.send_message(chat_id, ad['content'])
-        elif ad['type'] == 'photo':
-            bot.send_photo(chat_id, ad['file_id'], caption=ad['content'] if ad['content'] else '')
-        elif ad['type'] == 'video':
-            bot.send_video(chat_id, ad['file_id'], caption=ad['content'] if ad['content'] else '')
-        elif ad['type'] == 'document':
-            bot.send_document(chat_id, ad['file_id'], caption=ad['content'] if ad['content'] else '')
-        return True
-    except ApiTelegramException as e:
-        if e.error_code == 403:  # ربات از گروه حذف شده
-            conn = get_db()
-            cursor = conn.cursor()
-            cursor.execute('UPDATE groups SET is_active = 0 WHERE chat_id = ?', (chat_id,))
-            conn.commit()
-            conn.close()
-            logger.info(f"ربات از گروه {chat_id} حذف شده است")
+        if update_schedule_settings(interval=interval):
+            bot.reply_to(message, f"✅ فاصله ارسال به {interval} دقیقه تنظیم شد.")
+            clear_user_state(message.from_user.id)
+            bot.send_message(message.chat.id, "🔙 بازگشت به منوی اصلی", reply_markup=get_main_keyboard())
         else:
-            logger.error(f"خطا در ارسال به گروه {chat_id}: {e}")
-        return False
-    except Exception as e:
-        logger.error(f"خطای ناشناخته در ارسال به گروه {chat_id}: {e}")
-        return False
+            bot.reply_to(message, "❌ خطا در تنظیم فاصله.")
+            
+    except ValueError:
+        bot.reply_to(message, "❌ لطفاً یک عدد وارد کنید.")
 
-async def scheduled_sender():
-    """تابع اصلی ارسال خودکار"""
-    while True:
-        try:
-            conn = get_db()
-            cursor = conn.cursor()
+@bot.message_handler(func=lambda message: get_user_state(message.from_user.id)['state'] == 'waiting_max_sends')
+@admin_only
+def process_max_sends(message):
+    """پردازش تعداد ارسال"""
+    try:
+        max_sends = int(message.text)
+        if max_sends < 0:
+            bot.reply_to(message, "❌ تعداد نمی‌تواند منفی باشد.")
+            return
+        
+        if update_schedule_settings(max_sends=max_sends):
+            if max_sends == 0:
+                bot.reply_to(message, "✅ تعداد ارسال به حالت نامحدود تنظیم شد.")
+            else:
+                bot.reply_to(message, f"✅ تعداد ارسال به {max_sends} بار تنظیم شد.")
             
-            # دریافت تنظیمات
-            cursor.execute('SELECT * FROM schedule WHERE id = 1')
-            schedule = cursor.fetchone()
+            clear_user_state(message.from_user.id)
+            bot.send_message(message.chat.id, "🔙 بازگشت به منوی اصلی", reply_markup=get_main_keyboard())
+        else:
+            bot.reply_to(message, "❌ خطا در تنظیم تعداد.")
             
-            if schedule and schedule['is_active']:
-                # دریافت تبلیغات
-                cursor.execute('SELECT * FROM ads ORDER BY created_date DESC LIMIT 1')
-                ad = cursor.fetchone()
-                
-                # دریافت گروه‌های فعال
-                cursor.execute('SELECT * FROM groups WHERE is_active = 1')
-                groups = cursor.fetchall()
-                
-                if ad and groups:
-                    for group in groups:
-                        success = await send_ad_to_group(group['chat_id'], ad)
-                        if success:
-                            await asyncio.sleep(2)  # تاخیر بین ارسال به گروه‌ها
-                    
-                    # به‌روزرسانی آمار
-                    cursor.execute(
-                        'UPDATE schedule SET sent_count = sent_count + 1, last_sent = CURRENT_TIMESTAMP WHERE id = 1'
-                    )
-                    
-                    # بررسی پایان تعداد ارسال
-                    if schedule['total_count'] > 0 and schedule['sent_count'] + 1 >= schedule['total_count']:
-                        cursor.execute('UPDATE schedule SET is_active = 0 WHERE id = 1')
-                    
-                    conn.commit()
-                    logger.info(f"تبلیغ به {len(groups)} گروه ارسال شد")
-            
-            conn.close()
-            
-            # انتظار تا ارسال بعدی
-            interval = schedule['interval_minutes'] if schedule else 5
-            await asyncio.sleep(interval * 60)
-            
-        except Exception as e:
-            logger.error(f"خطا در ارسال خودکار: {e}")
-            await asyncio.sleep(60)
+    except ValueError:
+        bot.reply_to(message, "❌ لطفاً یک عدد وارد کنید.")
 
-def start_background_tasks():
-    """شروع تسک‌های پس‌زمینه"""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(scheduled_sender())
+@bot.message_handler(func=lambda message: message.text == "▶️ شروع ارسال")
+@admin_only
+def start_sending(message):
+    """شروع ارسال خودکار"""
+    if not get_active_advertisement():
+        bot.send_message(message.chat.id, "❌ ابتدا یک تبلیغ ثبت کنید.")
+        return
+    
+    if not get_all_groups():
+        bot.send_message(message.chat.id, "❌ حداقل یک گروه اضافه کنید.")
+        return
+    
+    if update_schedule_settings(is_running=True):
+        bot.send_message(message.chat.id, "✅ ارسال خودکار شروع شد!")
+    else:
+        bot.send_message(message.chat.id, "❌ خطا در شروع ارسال.")
 
-# ==================== Flask Endpoints ====================
-@app.route('/')
-def health_check():
-    """اندپوینت بررسی سلامت"""
-    return jsonify({
-        'status': 'active',
-        'timestamp': datetime.now().isoformat()
-    }), 200
+@bot.message_handler(func=lambda message: message.text == "⛔ توقف ارسال")
+@admin_only
+def stop_sending(message):
+    """توقف ارسال خودکار"""
+    if update_schedule_settings(is_running=False):
+        bot.send_message(message.chat.id, "⛔ ارسال خودکار متوقف شد.")
+    else:
+        bot.send_message(message.chat.id, "❌ خطا در توقف ارسال.")
 
+@bot.message_handler(func=lambda message: message.text == "📊 وضعیت")
+@admin_only
+def show_status(message):
+    """نمایش وضعیت"""
+    settings = get_schedule_settings()
+    ad = get_active_advertisement()
+    groups = get_all_groups()
+    
+    if not settings:
+        bot.reply_to(message, "❌ خطا در دریافت وضعیت.")
+        return
+    
+    text = "📊 وضعیت ربات:\n\n"
+    text += f"👥 گروه‌های فعال: {len(groups)}\n"
+    text += f"📝 تبلیغ: {'✅ موجود' if ad else '❌ ندارد'}\n"
+    text += f"⏱ فاصله: {settings['interval_minutes']} دقیقه\n"
+    text += f"📨 ارسال شده: {settings['current_sends']}\n"
+    text += f"🎯 هدف: {'نامحدود' if settings['max_sends'] == 0 else settings['max_sends']}\n"
+    text += f"⚡ وضعیت: {'✅ فعال' if settings['is_running'] else '⏸ غیرفعال'}\n"
+    
+    bot.send_message(message.chat.id, text)
+
+@bot.message_handler(func=lambda message: message.text == "🔙 بازگشت")
+def back_to_main(message):
+    """بازگشت به منوی اصلی"""
+    clear_user_state(message.from_user.id)
+    bot.send_message(message.chat.id, "🔙 بازگشت به منوی اصلی", reply_markup=get_main_keyboard())
+
+# ==================== Webhook و Flask ====================
 @app.route('/webhook', methods=['POST'])
 def webhook():
     """دریافت آپدیت‌های تلگرام"""
@@ -560,35 +613,43 @@ def webhook():
         update = telebot.types.Update.de_json(json_string)
         bot.process_new_updates([update])
         return '', 200
-    return 'Invalid request', 403
+    return 'OK', 200
 
-@app.route('/set-webhook', methods=['GET'])
-def set_webhook():
-    """تنظیم وب‌هوک (فقط برای ادمین)"""
-    webhook_url = f"{WEBHOOK_URL}/webhook"
-    bot.remove_webhook()
-    time.sleep(1)
-    bot.set_webhook(url=webhook_url)
+@app.route('/')
+def health_check():
+    """بررسی سلامت ربات"""
     return jsonify({
-        'status': 'webhook_set',
-        'url': webhook_url
+        'status': 'running',
+        'time': datetime.now().isoformat()
     }), 200
+
+@app.route('/set_webhook', methods=['GET'])
+def set_webhook():
+    """تنظیم webhook"""
+    try:
+        bot.remove_webhook()
+        time.sleep(1)
+        webhook_url = f"{WEBHOOK_URL}/webhook"
+        bot.set_webhook(url=webhook_url)
+        return jsonify({'status': 'success', 'webhook': webhook_url})
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 
 # ==================== اجرای اصلی ====================
 if __name__ == '__main__':
     # راه‌اندازی دیتابیس
     init_database()
     
-    # تنظیم وب‌هوک
-    webhook_url = f"{WEBHOOK_URL}/webhook"
-    bot.remove_webhook()
-    time.sleep(1)
-    bot.set_webhook(url=webhook_url)
-    logger.info(f"وب‌هوک تنظیم شد: {webhook_url}")
+    # تنظیم webhook
+    try:
+        webhook_url = f"{WEBHOOK_URL}/webhook"
+        bot.remove_webhook()
+        time.sleep(1)
+        bot.set_webhook(url=webhook_url)
+        logger.info(f"✅ Webhook تنظیم شد: {webhook_url}")
+    except Exception as e:
+        logger.error(f"❌ خطا در تنظیم webhook: {e}")
     
-    # شروع تسک پس‌زمینه در یک ترد جداگانه
-    Thread(target=start_background_tasks, daemon=True).start()
-    
-    # اجرای Flask
+    # اجرای سرور
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=port, debug=False)
