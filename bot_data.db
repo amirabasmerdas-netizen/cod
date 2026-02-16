@@ -1,0 +1,12 @@
+{
+  "groups_count": 0,
+  "groups": [],
+  "ad": null,
+  "settings": {
+    "interval_minutes": 5,
+    "max_sends": 0,
+    "current_sends": 0,
+    "is_running": 0,
+    ...
+  }
+}
